@@ -1,0 +1,13 @@
+# results of conversions (page images, OCR cache, outputs) - large and re-creatable
+* - output/
+# the scanned books themselves (80 MB, and copyrighted)
+*.pdf
+# keep the 26-page test excerpt the README uses (remove this line to leave it out too)
+!pages.pdf
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
+.upload-*.part

@@ -1,0 +1,9 @@
+pymupdf
+pytesseract
+pillow
+openpyxl
+python-docx
+numpy
+opencv-python-headless
+fastapi
+uvicorn
