@@ -1,0 +1,10 @@
+.git
+*.pdf
+!pages.pdf
+* - output
+books
+venv
+.venv
+__pycache__
+.pytest_cache
+.DS_Store

@@ -34,7 +34,8 @@ try:
 except ImportError:
     sys.exit("The web app needs FastAPI and Uvicorn:  pip install -r requirements.txt")
 
-import pdf2xlsx as core
+from bookocr import review as rv, settings
+from bookocr.export import export_book
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WEB = os.path.join(HERE, "web")
@@ -140,7 +141,8 @@ def project_info(pid):
         open_flags=sum(1 for h in hs if h["flags"] and not h.get("reviewed")),
         has_edits=has_edits, unexported=bool(edited_at and (exported_at is None or edited_at > exported_at)),
         files=files, updated=max([os.path.getmtime(out), edited_at or 0, exported_at or 0]),
-        chapters_txt=os.path.isfile(os.path.join(out, "chapters.txt")))
+        settings_file=os.path.basename(settings.path_for(pdf)), undo=undo_label(pid),
+        word_conf=bool(hs) and bool((_books.get(pid) or {}).get("word_conf")))
 
 
 @app.get("/api/projects")
@@ -246,7 +248,8 @@ class Job:
                     os.replace(review, os.path.join(self.out, self.backup))
             else:
                 self.status = "failed"
-            _books.pop(self.project, None)
+            forget(self.project)
+            _history.pop(self.project, None)                # the old snapshots belong to the replaced book
 
     def _parse(self, line):
         if re.match(r"\d+ pages in PDF, processing", line):
@@ -307,49 +310,45 @@ job = None
 
 @app.post("/api/projects/{pid}/run")
 def run(pid: str, opts: dict = Body(default={})):
+    """Start pdf2xlsx.py on the book. The book's own settings (title, pages, table of contents, chapter names) are
+    saved in its settings file first, so the command line and later runs use them too."""
     global job
     out = out_dir(pid)
     pdf = pdf_path(out)
     if not os.path.isfile(pdf):
         raise HTTPException(400, f"The PDF ({os.path.basename(pdf)}) is not in {LIBRARY} any more.")
-    cmd = [sys.executable, "-u", os.path.join(HERE, "pdf2xlsx.py"), pdf, "--out", out]
-    for key, flag in (("title", "--title"), ("pages", "--pages"), ("body_start", "--body-start"),
-                      ("workers", "--workers")):
-        v = str(opts.get(key) or "").strip()
-        if v:
-            cmd += [flag, v]
-    toc = str(opts.get("toc_pages") or "auto").strip()
-    if toc != "auto":
-        cmd += ["--toc-pages", toc]
-    for key, flag in (("keep_arabic", "--keep-arabic"), ("no_docx", "--no-docx"), ("debug", "--debug"),
-                      ("rebuild_only", "--rebuild-only")):
+    sf = settings.path_for(pdf)
+    s = settings.load(sf)
+    for key in ("title", "pages", "toc_pages"):
+        if key in opts:
+            s[key] = str(opts[key] or "").strip() or settings.DEFAULTS[key]
+    if "body_start" in opts:
+        s["body_start"] = int(opts["body_start"]) if str(opts["body_start"] or "").strip() else None
+    if "no_docx" in opts:
+        s["no_docx"] = bool(opts["no_docx"])
+    if "chapters" in opts:
+        s["chapters"] = [l.strip() for l in str(opts["chapters"] or "").splitlines() if l.strip()]
+    cmd = [sys.executable, "-u", os.path.join(HERE, "pdf2xlsx.py"), pdf, "--out", out, "--settings", sf]
+    v = str(opts.get("workers") or "").strip()
+    if v:
+        cmd += ["--workers", v]
+    for key, flag in (("debug", "--debug"), ("rebuild_only", "--rebuild-only"), ("re_ocr", "--re-ocr")):
         if opts.get(key):
             cmd.append(flag)
-    chapters = [l.strip() for l in str(opts.get("chapters") or "").splitlines() if l.strip()]
-    cf = os.path.join(out, "chapters.txt")
-    if chapters:
-        with open(cf, "w", encoding="utf8") as f:
-            f.write("\n".join(chapters) + "\n")
-    elif os.path.exists(cf) and opts.get("chapters") is not None:
-        os.remove(cf)                              # the field was emptied: back to the default chapters.txt
-    if os.path.exists(cf):
-        cmd += ["--chapters-file", cf]
     with lock:
         if job is not None and job.status == "running":
             raise HTTPException(409, f"“{job.project}” is still being converted. Wait for it or cancel it first.")
+        settings.save(sf, s)
         job = Job(pid, cmd, out)
-        write_json(os.path.join(out, "run_options.json"), opts)
         return job.state()
 
 
 @app.get("/api/projects/{pid}/options")
 def run_options(pid: str):
-    out = out_dir(pid)
-    opts = read_json(os.path.join(out, "run_options.json"), {})
-    cf = os.path.join(out, "chapters.txt")
-    if os.path.exists(cf):
-        opts["chapters"] = open(cf, encoding="utf8").read()
-    return opts
+    """The book's settings, as the convert dialog shows them."""
+    s = settings.load(settings.path_for(pdf_path(out_dir(pid))))
+    s["chapters"] = "\n".join(s["chapters"])
+    return s
 
 
 @app.post("/api/job/cancel")
@@ -389,6 +388,9 @@ async def job_events(request: Request, since: int = 0):
 
 # =============================================================================== review
 _books = {}
+_history = {}                                    # pid -> [(label, book as JSON)]: what Undo restores, newest last
+_spell = {}                                      # pid -> (book version, result)
+HISTORY = 30
 
 
 def get_book(pid):
@@ -400,33 +402,65 @@ def get_book(pid):
         book = read_json(os.path.join(out, "book.review.json")) or read_json(os.path.join(out, "book.json"))
         if book is None:
             raise HTTPException(409, "This book has no review data yet. Run the conversion first.")
+        book["_v"] = 0
         _books[pid] = book
         return book
 
 
 def save_book(pid, book):
     with lock:
-        write_json(os.path.join(out_dir(pid), "book.review.json"), book)
+        book["_v"] = book.get("_v", 0) + 1
+        write_json(os.path.join(out_dir(pid), "book.review.json"), {k: v for k, v in book.items() if k != "_v"})
         _books[pid] = book
 
 
-def find(book, uid):
-    for i, h in enumerate(book["hadiths"]):
-        if h["uid"] == uid:
-            return i, h
-    raise HTTPException(404, "This hadith no longer exists (it was merged or deleted).")
+def forget(pid):
+    """The book on disk was replaced (new conversion, edits discarded): drop what is cached about it."""
+    _books.pop(pid, None)
+    _spell.pop(pid, None)
+
+
+def remember(pid, label):
+    """Snapshot the book before an edit that Undo can take back."""
+    stack = _history.setdefault(pid, [])
+    stack.append((label, json.dumps(get_book(pid), ensure_ascii=False)))
+    del stack[:-HISTORY]
+
+
+def undo_label(pid):
+    stack = _history.get(pid)
+    return stack[-1][0] if stack else None
+
+
+def edit(pid, label, fn, *args):
+    """Run one Undo-able edit (a bookocr.review function) on the book and save it.
+    -> {"book", "undo", "result"} - the whole book, since an edit can touch many hadiths."""
+    with lock:
+        book = get_book(pid)
+        remember(pid, label)
+        try:
+            result = fn(book, *args)
+        except rv.EditError as e:
+            _history[pid].pop()
+            raise HTTPException(400, str(e))
+        save_book(pid, book)
+        return dict(book=book, undo=undo_label(pid), result=result)
 
 
 @app.get("/api/projects/{pid}/book")
 def book_data(pid: str):
-    return get_book(pid)
+    return dict(book=get_book(pid), undo=undo_label(pid))
 
 
 @app.patch("/api/projects/{pid}/hadiths/{uid}")
 def edit_hadith(pid: str, uid: str, change: dict = Body(...)):
+    """Small edits of one hadith (typing, number, section, reviewed): saved at once, not Undo steps."""
     with lock:
         book = get_book(pid)
-        _, h = find(book, uid)
+        try:
+            _, h = rv.find(book, uid)
+        except rv.EditError as e:
+            raise HTTPException(404, str(e))
         if "text" in change:
             h["text"] = str(change["text"])           # as typed; export_book trims it
         if "no" in change:
@@ -443,71 +477,120 @@ def edit_hadith(pid: str, uid: str, change: dict = Body(...)):
         return h
 
 
+def _no(pid, uid):
+    """The hadith's number, for Undo labels ("Split hadith 12"); 404 if it is gone."""
+    try:
+        h = rv.find(get_book(pid), uid)[1]
+    except rv.EditError as e:
+        raise HTTPException(404, str(e))
+    return h["no"] if h["no"] is not None else "?"
+
+
 @app.post("/api/projects/{pid}/hadiths/{uid}/split")
 def split_hadith(pid: str, uid: str, body: dict = Body(...)):
     """Cut a hadith in two at a character offset (two hadiths the OCR ran together)."""
-    with lock:
-        book = get_book(pid)
-        i, h = find(book, uid)
-        at = int(body.get("offset", 0))
-        head, tail = h["text"][:at].strip(), h["text"][at:].strip()
-        if not head or not tail:
-            raise HTTPException(400, "Put the cursor inside the text, where the second hadith begins.")
-        uid2 = f"h{book.get('next_uid', len(book['hadiths']))}"
-        book["next_uid"] = book.get("next_uid", len(book["hadiths"])) + 1
-        no = body.get("no", h["no"] + 1 if h["no"] is not None else None)
-        new = dict(h, uid=uid2, no=no, text=tail, ocr_text=tail, arabic="", foot="", flags=["manual_split"],
-                   anchor=None, reviewed=False, page_start=h["page_end"])
-        h["text"] = head
-        book["hadiths"].insert(i + 1, new)
-        save_book(pid, book)
-        return dict(first=h, second=new)
+    r = edit(pid, f"Split hadith {_no(pid, uid)}", rv.split, uid, int(body.get("offset", 0)), body.get("no"))
+    r["result"] = r["result"][1]["uid"]                 # the new hadith
+    return r
 
 
 @app.post("/api/projects/{pid}/hadiths/{uid}/merge")
 def merge_hadith(pid: str, uid: str):
-    """Append a hadith to the one before it (a stray marker split one hadith in two)."""
-    with lock:
-        book = get_book(pid)
-        i, h = find(book, uid)
-        if i == 0:
-            raise HTTPException(400, "The first hadith has nothing before it to merge into.")
-        prev = book["hadiths"][i - 1]
-        prev["text"] = (prev["text"] + " " + h["text"]).strip()
-        prev["ocr_text"] = (prev["ocr_text"] + " " + h["ocr_text"]).strip()
-        prev["page_end"] = max(prev["page_end"], h["page_end"])
-        if h["foot"] and not prev["foot"]:
-            prev["foot"] = h["foot"]
-        del book["hadiths"][i]
-        save_book(pid, book)
-        return prev
+    r = edit(pid, f"Merge hadith {_no(pid, uid)}", rv.merge, uid)
+    r["result"] = r["result"]["uid"]                    # the hadith it was merged into
+    return r
 
 
 @app.delete("/api/projects/{pid}/hadiths/{uid}")
 def delete_hadith(pid: str, uid: str):
+    return edit(pid, f"Delete hadith {_no(pid, uid)}", rv.delete, uid)
+
+
+@app.post("/api/projects/{pid}/hadiths/{uid}/new-section")
+def new_section(pid: str, uid: str, body: dict = Body(...)):
+    return edit(pid, f"New section at hadith {_no(pid, uid)}", rv.new_section, uid, body.get("name", ""))
+
+
+@app.post("/api/projects/{pid}/search")
+def search(pid: str, body: dict = Body(...)):
+    try:
+        pat = rv.pattern(body.get("find", ""), body.get("regex"), body.get("word"))
+    except rv.EditError as e:
+        raise HTTPException(400, str(e))
+    matches, total = rv.search(get_book(pid), pat)
+    return dict(matches=matches, total=total, hadiths=len(matches))
+
+
+@app.post("/api/projects/{pid}/replace")
+def replace(pid: str, body: dict = Body(...)):
+    """Replace in the whole book (or the hadiths in body["uids"]); body["remember"] also saves the correction in the
+    book's settings file, so the next conversions of this book apply it by themselves."""
+    find_text, rep = body.get("find", ""), body.get("replace", "")
+    try:
+        pat = rv.pattern(find_text, body.get("regex"), body.get("word"))
+    except rv.EditError as e:
+        raise HTTPException(400, str(e))
+    r = edit(pid, f"Replace “{find_text}”", rv.replace, pat, rep, bool(body.get("regex")), body.get("uids"))
+    if body.get("remember"):
+        settings.add_fix(settings.path_for(pdf_path(out_dir(pid))), find_text, rep, body.get("regex"), body.get("word"))
+    return r
+
+
+@app.get("/api/projects/{pid}/spelling")
+def spelling(pid: str):
     with lock:
         book = get_book(pid)
-        i, _ = find(book, uid)
-        del book["hadiths"][i]
-        save_book(pid, book)
-        return dict(ok=True)
+        cached = _spell.get(pid)
+        if not cached or cached[0] != book.get("_v"):
+            cached = _spell[pid] = (book.get("_v"), rv.spelling(book))
+        return cached[1]
+
+
+@app.post("/api/projects/{pid}/spelling/ignore")
+def ignore_word(pid: str, body: dict = Body(...)):
+    return edit(pid, f"Ignore “{body.get('word', '')}”", rv.ignore_word, str(body.get("word", "")))
 
 
 @app.put("/api/projects/{pid}/structure")
 def edit_structure(pid: str, body: dict = Body(...)):
-    """Rename the book, its chapters and sections (the number of each stays as the conversion found it)."""
+    """Rename the book, its chapters and sections."""
+    return edit(pid, "Rename chapters and sections", rv.rename, body.get("title"), body.get("chapters"),
+                body.get("sections"))
+
+
+@app.post("/api/projects/{pid}/structure/{action}")
+def structure_action(pid: str, action: str, body: dict = Body(...)):
+    """delete-section {section} · move-section {section, chapter} · add-chapter {at, name} · delete-chapter {chapter}"""
+    book = get_book(pid)
+    try:
+        if action == "delete-section":
+            si = int(body["section"])
+            return edit(pid, f"Delete section {si + 1}", rv.delete_section, si)
+        if action == "move-section":
+            si, ci = int(body["section"]), int(body["chapter"])
+            return edit(pid, f"Move section {si + 1}", rv.move_section, si, ci)
+        if action == "add-chapter":
+            return edit(pid, "Add chapter", rv.add_chapter, int(body.get("at", len(book["chapters"]))),
+                        body.get("name", ""))
+        if action == "delete-chapter":
+            ci = int(body["chapter"])
+            return edit(pid, f"Delete chapter {ci + 1}", rv.delete_chapter, ci)
+    except (KeyError, ValueError, TypeError):
+        raise HTTPException(400, "Incomplete request.")
+    raise HTTPException(404, "Unknown action.")
+
+
+@app.post("/api/projects/{pid}/undo")
+def undo(pid: str):
     with lock:
-        book = get_book(pid)
-        for key in ("chapters", "sections"):
-            if key in body:
-                names = [str(t).strip() for t in body[key]]
-                if len(names) != len(book[key]):
-                    raise HTTPException(400, f"Expected {len(book[key])} {key}.")
-                book[key] = names
-        if "title" in body and str(body["title"]).strip():
-            book["title"] = str(body["title"]).strip()
+        stack = _history.get(pid)
+        if not stack:
+            raise HTTPException(409, "Nothing to undo.")
+        label, snap = stack.pop()
+        book = json.loads(snap)
+        book["_v"] = get_book(pid).get("_v", 0)
         save_book(pid, book)
-        return book
+        return dict(book=book, undo=undo_label(pid), undone=label)
 
 
 @app.post("/api/projects/{pid}/export")
@@ -516,7 +599,7 @@ def export(pid: str, body: dict = Body(default={})):
         book = get_book(pid)
         out = out_dir(pid)
         try:
-            made = core.export_book(book, out, docx=body.get("docx", True))
+            made = export_book(book, out, docx=body.get("docx", True))
         except PermissionError:
             raise HTTPException(409, "A file could not be written. Is book.xlsx or book.docx open in Excel or Word? "
                                      "Close it and try again.")
@@ -525,11 +608,13 @@ def export(pid: str, body: dict = Body(default={})):
 
 @app.post("/api/projects/{pid}/discard")
 def discard_edits(pid: str):
+    """Back to the OCR result. Undo brings the edits back (while the app keeps running)."""
     with lock:
         p = os.path.join(out_dir(pid), "book.review.json")
         if os.path.exists(p):
+            remember(pid, "Discard edits")
             os.remove(p)
-        _books.pop(pid, None)
+        forget(pid)
     return project_info(pid)
 
 
@@ -558,12 +643,15 @@ def page_image(pid: str, page: int):
 def reveal(pid: str):
     """Show the output folder in Finder / Explorer."""
     out = out_dir(pid)
-    if sys.platform == "darwin":
-        subprocess.run(["open", out])
-    elif os.name == "nt":
-        os.startfile(out)
-    else:
-        subprocess.run(["xdg-open", out])
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["open", out], check=True)
+        elif os.name == "nt":
+            os.startfile(out)
+        else:
+            subprocess.run(["xdg-open", out], check=True)
+    except (OSError, subprocess.CalledProcessError):
+        raise HTTPException(400, f"Could not open a folder window here. The files are in {out}")
     return dict(ok=True)
 
 
@@ -571,11 +659,11 @@ app.mount("/", StaticFiles(directory=WEB, html=True), name="web")
 
 
 # =============================================================================== main
-def free_port(start):
+def free_port(host, start):
     for port in range(start, start + 20):
         with socket.socket() as s:
             try:
-                s.bind(("127.0.0.1", port))
+                s.bind((host, port))
                 return port
             except OSError:
                 continue
@@ -588,16 +676,18 @@ def main():
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--library", default=HERE, help="folder for uploaded PDFs and their output folders")
     ap.add_argument("--no-browser", action="store_true", help="do not open the browser")
+    ap.add_argument("--host", default="127.0.0.1", help="address to listen on (0.0.0.0 inside Docker; the app "
+                                                       "still answers only requests addressed to localhost)")
     a = ap.parse_args()
     LIBRARY = os.path.abspath(os.path.expanduser(a.library))
     os.makedirs(LIBRARY, exist_ok=True)
-    port = free_port(a.port)
+    port = free_port(a.host, a.port)
     url = f"http://localhost:{port}"
     print(f"pdf2xlsx is running at {url}   (library: {LIBRARY})\nPress Ctrl+C to stop.", flush=True)
     if not a.no_browser:
         threading.Timer(1.0, webbrowser.open, (url,)).start()
     try:
-        uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
+        uvicorn.run(app, host=a.host, port=port, log_level="warning")
     finally:
         if job is not None and job.status == "running":
             job.cancel()
